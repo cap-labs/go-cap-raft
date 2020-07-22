@@ -6,6 +6,8 @@ import (
 	"github.com/libs4go/smf4go"
 )
 
+//go:generate protoc --proto_path=./proto-cap --go_out=plugins=grpc,paths=source_relative:. raft.proto
+
 type raftConsensus struct {
 	Stream cap.NetworkStreamClient `inject:"raft.network.stream"`
 }
