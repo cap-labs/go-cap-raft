@@ -1,0 +1,19 @@
+{
+  "smf4go": {
+    "service": {
+      "raft.consensus": {
+        "id": "test"
+      },
+      "raft.cluster.manager": {
+        "peers": [
+          {
+            "id": "test",
+            "address": "127.0.0.1:1001"
+          }
+        ],
+        "heartbeatTimeout": 40,
+        "electionTimeout": 150
+      }
+    }
+  }
+}

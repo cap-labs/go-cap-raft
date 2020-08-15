@@ -2,14 +2,15 @@ package raft
 
 import (
 	"context"
-	"encoding/json"
+	"math/rand"
 	"sync"
 	"time"
 
-	"github.com/cap-labs/go-cap"
 	"github.com/cap-labs/go-cap/raft"
 	"github.com/libs4go/errors"
+	"github.com/libs4go/scf4go"
 	"github.com/libs4go/slf4go"
+	"github.com/libs4go/smf4go"
 )
 
 // ScopeOfAPIError .
@@ -20,193 +21,129 @@ var (
 	ErrParams = errors.New("required parameter error", errors.WithVendor(errVendor), errors.WithCode(-1))
 )
 
-type consensusState interface {
-	json.Marshaler
-	Tick(context.Context, *ConsensusNode) error
-	Exec(ctx context.Context, cn *ConsensusNode, in *raft.RequestExec) (*raft.ResponseExec, error)
-	NewCluster(ctx context.Context, cn *ConsensusNode, in *raft.Cluster) (*raft.ResponseCluster, error)
-	Vote(context.Context, *ConsensusNode, *raft.RequestVote) (*raft.ResponseVote, error)
-	AppendEntries(context.Context, *ConsensusNode, *raft.RequestAppendEntries) (*raft.ResponseAppendEntries, error)
-	InstallSnapshot(context.Context, *ConsensusNode, *raft.RequestInstallSnapshot) (*raft.ResponseInstallSnapshot, error)
+type consenusImpl struct {
+	slf4go.Logger     `json:"-"`
+	Network           raft.Network                           `inject:"raft.network" json:"-"`
+	ClusterManager    raft.ClusterManager                    `inject:"raft.cluster.manager" json:"-"`
+	LogStore          raft.LogStore                          `inject:"raft.logstore" json:"-"`
+	Locker            sync.Locker                            `inject:"raft.locker"`
+	ID                string                                 `json:"id"`
+	ElectionTimeout   time.Duration                          `json:"election-timeout"`
+	Leader            string                                 `json:"leader"`
+	LeaderUpdateTimpe time.Time                              `json:"last-leader-update-time"`
+	RemoteSMs         map[string]raft.RaftStateMachineClient `json:"remote-state-machines"`
+	State             consenusState                          `json:"state"`
+	Tick              time.Duration                          `json:"tick"`
 }
 
-// ConsensusNode .
-type ConsensusNode struct {
-	slf4go.Logger          `json:"-"`                             // mixin slf4go logger
-	sync.Locker                                                   // consensus locker
-	ID                     string                                 `json:"id"`                 // consensus node id
-	ElectionTimeout        time.Duration                          `json:"election_timeout"`   // election timeout
-	HeartbeatTimeout       time.Duration                          `json:"heart_beat_timeout"` // leader heartbeat timeout  HeartbeatTimeout * 10 < ElectionTimeout
-	RemotePeers            map[string]raft.RaftStateMachineClient `json:"remote"`             // remote raft state machine rpc client
-	State                  consensusState                         `json:"state"`              // conseusus state object
-	Term                   uint64                                 `json:"term"`               // current raft term
-	Store                  raft.LogStore                          `json:"-"`                  // consensus logstore service
-	Network                raft.Network                           `json:"-"`                  // consensus network service
-	ClusterManager         raft.ClusterManager                    `json:"-"`                  // consensus cluster manager
-	LastHeartBeatTimestamp time.Time                              `json:"updated"`            // consensus follower node received last heartbeat timestamp
-	Leader                 string                                 `json:"leader"`             // leader id
+// New create new raft consenus service for smf4go
+func New(config scf4go.Config) (smf4go.Service, error) {
+
+	id := config.Get("id").String("")
+
+	if id == "" {
+		return nil, errors.Wrap(ErrParams, "expect local consensus node id")
+	}
+
+	return &consenusImpl{
+		Logger:    slf4go.Get("raft-consensus"),
+		ID:        id,
+		RemoteSMs: make(map[string]raft.RaftStateMachineClient),
+		Tick:      config.Get("tick").Duration(10 * time.Millisecond),
+	}, nil
 }
 
-// ConsensusOption .
-type ConsensusOption func(*ConsensusNode)
+func (c *consenusImpl) Start() error {
 
-// ElectionTimeout .
-func ElectionTimeout(duration time.Duration) ConsensusOption {
-	return func(node *ConsensusNode) {
-		node.ElectionTimeout = duration
-	}
-}
-
-// HeartBeatTimeout .
-func HeartBeatTimeout(duration time.Duration) ConsensusOption {
-	return func(node *ConsensusNode) {
-		node.HeartbeatTimeout = duration
-	}
-}
-
-// ClusterManager .
-func ClusterManager(clusterManager raft.ClusterManager) ConsensusOption {
-	return func(node *ConsensusNode) {
-		node.ClusterManager = clusterManager
-	}
-}
-
-// Network .
-func Network(network raft.Network) ConsensusOption {
-	return func(node *ConsensusNode) {
-		node.Network = network
-	}
-}
-
-// LogStore .
-func LogStore(store raft.LogStore) ConsensusOption {
-	return func(node *ConsensusNode) {
-		node.Store = store
-	}
-}
-
-// Locker set consensus node invoke locker
-func Locker(locker sync.Locker) ConsensusOption {
-	return func(node *ConsensusNode) {
-		node.Locker = locker
-	}
-}
-
-// New .
-func New(
-	local *cap.Peer,
-	options ...ConsensusOption) (*ConsensusNode, error) {
-
-	node := &ConsensusNode{
-		Logger:          slf4go.Get("raft-node"),
-		Locker:          &nullLocker{},
-		ID:              local.Id,
-		ElectionTimeout: time.Millisecond * 150,
-		RemotePeers:     make(map[string]raft.RaftStateMachineClient),
-		State:           &followerState{},
-	}
-
-	for _, option := range options {
-		option(node)
-	}
-
-	if node.HeartbeatTimeout == 0 {
-		node.HeartbeatTimeout = node.ElectionTimeout / 10
-	}
-
-	if node.Network == nil {
-		return nil, errors.Wrap(ErrParams, "expect Network option")
-	}
-
-	if node.Store == nil {
-		return nil, errors.Wrap(ErrParams, "expect LogStore option")
-	}
-
-	if node.ClusterManager == nil {
-		return nil, errors.Wrap(ErrParams, "expect ClusterManager option")
-	}
-
-	cluster, err := node.ClusterManager.Get()
+	cluster, err := c.ClusterManager.Get()
 
 	if err != nil {
-		return nil, err
+		return err
 	}
 
+	c.ElectionTimeout = time.Duration(cluster.ElectionTimeout) * time.Millisecond
+
+	// calc randomized election timeout
+
+	c.ElectionTimeout += time.Duration(rand.Int63n(int64(cluster.ElectionTimeout))) * time.Millisecond
+
+	var local *raft.Peer = nil
+
+	// create remote state machine rpc clients
 	for _, peer := range cluster.Peers {
-		client, err := node.Network.Connect(peer)
+		if peer.Id != c.ID {
+			client, err := c.Network.Connect(peer)
 
-		if err != nil {
-			return nil, err
+			if err != nil {
+				return errors.Wrap(err, "connnect to peer %s error", peer.Id)
+			}
+
+			c.RemoteSMs[peer.Id] = client
+		} else {
+			local = peer
 		}
-
-		node.RemotePeers[peer.Id] = client
 	}
 
-	lastEntry, err := node.Store.LastEntry()
-
-	if err != nil {
-		return nil, err
+	if local == nil {
+		return errors.Wrap(ErrParams, "cluster config miss local peer '%s'", c.ID)
 	}
 
-	if lastEntry != nil {
-		node.Term = lastEntry.Term
-	}
+	c.State = &followerState{}
 
-	node.LastHeartBeatTimestamp = time.Now()
+	c.LeaderUpdateTimpe = time.Now()
 
-	node.I("start consenus with config: \n{@config}", node)
+	c.Network.Serve(local, c)
 
-	node.Network.Serve(local, node)
+	go c.tickLoop()
 
-	return node, nil
+	return nil
 }
 
-// Vote .
-func (cn *ConsensusNode) Vote(ctx context.Context, request *raft.RequestVote) (*raft.ResponseVote, error) {
-	cn.Lock()
-	defer cn.Unlock()
+func (c *consenusImpl) tickLoop() {
+	ticker := time.NewTicker(c.Tick)
 
-	return cn.State.Vote(ctx, cn, request)
-}
+	defer ticker.Stop()
 
-// AppendEntries .
-func (cn *ConsensusNode) AppendEntries(ctx context.Context, request *raft.RequestAppendEntries) (*raft.ResponseAppendEntries, error) {
-	cn.Lock()
-	defer cn.Unlock()
-	return cn.State.AppendEntries(ctx, cn, request)
-}
-
-// InstallSnapshot .
-func (cn *ConsensusNode) InstallSnapshot(ctx context.Context, request *raft.RequestInstallSnapshot) (*raft.ResponseInstallSnapshot, error) {
-	cn.Lock()
-	defer cn.Unlock()
-	return cn.State.InstallSnapshot(ctx, cn, request)
-}
-
-// Tick invoke consensus tick route
-func (cn *ConsensusNode) Tick() {
-	cn.Lock()
-	defer cn.Unlock()
-
-	err := cn.State.Tick(context.Background(), cn)
-
-	if err != nil {
-		cn.E("")
+	for range ticker.C {
+		c.Locker.Lock()
+		c.State.Tick(c)
+		c.Locker.Unlock()
 	}
 }
 
-// Exec .
-func (cn *ConsensusNode) Exec(ctx context.Context, request *raft.RequestExec) (*raft.ResponseExec, error) {
-	cn.Lock()
-	defer cn.Unlock()
+// consensus apis
 
-	return cn.State.Exec(ctx, cn, request)
+func (c *consenusImpl) Command(ctx context.Context, in *raft.CommandRequest) (*raft.CommandResponse, error) {
+	c.Locker.Lock()
+	defer c.Locker.Unlock()
+
+	return c.State.Command(ctx, c, in)
 }
 
-// NewCluster .
-func (cn *ConsensusNode) NewCluster(ctx context.Context, request *raft.Cluster) (*raft.ResponseCluster, error) {
-	cn.Lock()
-	defer cn.Unlock()
+func (c *consenusImpl) ChangeCluster(ctx context.Context, in *raft.Cluster) (*raft.ChangeClusterResponse, error) {
+	c.Locker.Lock()
+	defer c.Locker.Unlock()
 
-	return cn.State.NewCluster(ctx, cn, request)
+	return c.State.ChangeCluster(ctx, c, in)
+}
+
+func (c *consenusImpl) Vote(ctx context.Context, in *raft.RequestVote) (*raft.ResponseVote, error) {
+	c.Locker.Lock()
+	defer c.Locker.Unlock()
+
+	return c.State.Vote(ctx, c, in)
+}
+
+func (c *consenusImpl) AppendEntries(ctx context.Context, in *raft.RequestAppendEntries) (*raft.ResponseAppendEntries, error) {
+	c.Locker.Lock()
+	defer c.Locker.Unlock()
+
+	return c.State.AppendEntries(ctx, c, in)
+}
+
+func (c *consenusImpl) InstallSnapshot(ctx context.Context, in *raft.RequestInstallSnapshot) (*raft.ResponseInstallSnapshot, error) {
+	c.Locker.Lock()
+	defer c.Locker.Unlock()
+
+	return c.State.InstallSnapshot(ctx, c, in)
 }
